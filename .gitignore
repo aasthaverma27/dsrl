@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtualenv
+.venv/
+venv/
+
+# Training artifacts: checkpoints, replay buffers, videos, logs
+runs/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
