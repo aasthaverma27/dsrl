@@ -162,7 +162,7 @@ class CubeSortEnv:
         return 2 * N_JOINTS + 9 + 9 + 1
 
     # ---------- lifecycle ----------
-
+    
     def reset(self, config_idx: int | None = None):
         self.sim.reset()                 # their reset; rewinds the clock
         self.sim.randomize_cubes()       # their cube schedule

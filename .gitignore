@@ -12,7 +12,13 @@ venv/
 # Training artifacts: checkpoints, replay buffers, videos, logs
 runs/
 
+# Reference material: DSRL/SDN/FRS papers and clones of the official repos.
+# Local reading only -- 57 MB including a 30 MB PDF, and the clones carry their own
+# .git so git would record them as broken gitlinks with no .gitmodules.
+trial/
+
 # Editor / OS
 .vscode/
 .idea/
 .DS_Store
+

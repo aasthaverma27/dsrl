@@ -22,6 +22,9 @@ ACK_PORT = int(os.environ.get("DSRL_ACK_PORT", 5597))
 # A seed older than this is ignored: DSRL is only steering while it is publishing.
 # Two chunks (0.8 s each) plus slack.
 SEED_TTL = float(os.environ.get("DSRL_SEED_TTL", 2.5))
+# Off by default: requesting features costs ~256 KB per query on the wire and is only
+# needed by DSRL-NA. Set DSRL_RETURN_FEATURES=1 in the client's environment to enable.
+RETURN_FEATURES = os.environ.get("DSRL_RETURN_FEATURES", "0") == "1"
 _sub = None
 _ack = None
 _latest = None
@@ -69,11 +72,26 @@ def current_options():
     if _latest is None:
         return None
     seed = np.asarray(_latest["seed"], dtype=np.float32)
+    step = int(_latest.get("step", -1))
     try:
-        _ack_socket().send(msgpack.packb({"step": int(_latest.get("step", -1))}))
+        _ack_socket().send(msgpack.packb({"step": step}))
     except Exception:
         pass
-    return {"dsrl_noise": seed}
+    # `step` lets the client tag its feedback so DSRL can pair an action chunk with
+    # the seed that produced it. `dsrl_return_features` asks the policy to hand back
+    # the action chunk and backbone features it already computed (see the hook in
+    # gr00t_policy.get_action); without the flag their return path is unchanged.
+    # The DSRL side decides whether it needs features (it knows if noise aliasing or
+    # the visual observation is on), so the flag rides on the seed message rather than
+    # living in the client's environment. Falls back to the env var if absent.
+    want = bool(_latest.get("feat", RETURN_FEATURES))
+    opts = {"dsrl_noise": seed, "step": step, "dsrl_return_features": want}
+    # DSRL-NA: extra candidate seeds are denoised in the same batched pass and returned
+    # as dsrl_candidate_actions, giving (noise, action) pairs for the Q^W distillation
+    # at ~7 ms for 16 candidates. Absent -> the stock single-seed path.
+    if _latest.get("extra") is not None:
+        opts["dsrl_extra_noise"] = np.asarray(_latest["extra"], dtype=np.float32)
+    return opts
 
 
 class SeedPublisher:
@@ -86,13 +104,12 @@ class SeedPublisher:
         self.ack = ctx.socket(zmq.PULL)
         self.ack.bind(f"tcp://0.0.0.0:{ack_port}")
 
-    def send(self, seed: np.ndarray, step: int = 0):
-        self.sock.send(
-            msgpack.packb(
-                {"seed": np.asarray(seed, dtype=np.float32), "step": step},
-                default=mnp.encode,
-            )
-        )
+    def send(self, seed: np.ndarray, step: int = 0, extra: np.ndarray | None = None,
+             feat: bool = False):
+        msg = {"seed": np.asarray(seed, dtype=np.float32), "step": step, "feat": bool(feat)}
+        if extra is not None:
+            msg["extra"] = np.asarray(extra, dtype=np.float32)
+        self.sock.send(msgpack.packb(msg, default=mnp.encode))
 
     def wait_ack(self, step: int, timeout: float = 3.0) -> bool:
         """Block until the client reports consuming this step's seed."""

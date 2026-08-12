@@ -16,15 +16,21 @@ import msgpack_numpy as mnp
 import numpy as np
 import zmq
 
+from dsrl.groot.feedback import FeedbackReceiver
 from dsrl.groot.seed_source import SeedPublisher
 from dsrl.rewards import RewardFn, placed_mask
 
 TASK_PORT = 5599
 N_JOINTS = 43
 SEED_SHAPE = (1, 40, 132)
-# right_arm and right_hand columns of the served 35-dim action, rows 0..15
+# right_arm and right_hand columns of the served 35-dim action. Steer only the rows
+# the client actually executes (cfg.env.execute_steps), because a row that is
+# generated and discarded costs a dimension without buying control.
+# Authority sweep, 2026-08-11 -- share of executed-action variation governed:
+#   rows 0-15 x arm14  224 dims  81.5% control   3.64 control/dim
+#   rows 0-3  x arm14   56 dims  75.1% control  13.42 control/dim  <- chosen
+#   rows 0-3  x live35 140 dims  81.1% control   5.79 control/dim
 STEER_COLS = np.array([7, 8, 9, 10, 11, 12, 13, 21, 22, 23, 24, 25, 26, 27])
-STEER_ROWS = np.arange(16)
 
 
 class StackEnv:
@@ -39,9 +45,33 @@ class StackEnv:
         self.task_port = task_port
         self.seeds = SeedPublisher()
         self.reward_fn = RewardFn(cfg.reward)
+        # DSRL-NA: candidate seeds ride along with the real one and are denoised in the
+        # same batched pass, so the (noise, action) pairs cost ~7 ms for 16 candidates.
+        self.na = cfg.sac.use_noise_aliasing
+        self.k_pairs = cfg.sac.na_pairs if self.na else 0
+        self.visual = cfg.sac.visual_features
+        self.visual_dim = cfg.sac.visual_dim if self.visual else 0
+        self.feedback = FeedbackReceiver() if (self.na or self.visual) else None
+        # Fixed random projection of the pooled backbone features. Unit-norm rows and
+        # an L2-normalised input keep the outputs O(1) with no running statistics to
+        # drift. Seeded, so the mapping is identical across runs and checkpoints.
+        if self.visual:
+            g = np.random.default_rng(12345)
+            dim = cfg.groot.backbone_embedding_dim
+            P = g.standard_normal((dim, self.visual_dim))
+            # Columns scaled to sqrt(dim), not 1. Projecting a unit-norm 2048-dim
+            # vector onto unit columns gives components of order 1/sqrt(2048) ~ 0.02,
+            # which would sit two orders of magnitude below the rest of the
+            # observation (joint angles, contacts, yaw features are all O(1)) and be
+            # effectively invisible to the first layer. This puts them at O(1).
+            self.visual_proj = (P / np.linalg.norm(P, axis=0, keepdims=True)
+                                * np.sqrt(dim)).astype(np.float32)
+            self.last_visual = np.zeros(self.visual_dim, dtype=np.float32)
 
         self.share = cfg.groot.share_across_chunk
-        self.action_dim = len(STEER_COLS) if self.share else len(STEER_ROWS) * len(STEER_COLS)
+        # Only the executed rows are worth steering; see the authority sweep above.
+        self.steer_rows = np.arange(cfg.env.execute_steps)
+        self.action_dim = len(STEER_COLS) if self.share else len(self.steer_rows) * len(STEER_COLS)
         self.chunk_secs = cfg.env.execute_steps / cfg.env.control_hz
         self.step_index = 0
         self.episode = 0
@@ -51,10 +81,11 @@ class StackEnv:
         # GrootConfig.freeze_base_noise for the measurements either way.
         self.freeze_noise = cfg.groot.freeze_base_noise
         self.base_noise = self.rng.standard_normal(SEED_SHAPE).astype(np.float32)
-        print(f"[env] action_dim={self.action_dim} "
-              f"({'shared across 16 chunk rows' if self.share else 'per-row'}), "
-              f"base_noise {'frozen for the run' if self.freeze_noise else 'redrawn each episode'}",
-              flush=True)
+        print(f"[env] action_dim={self.action_dim} = {len(self.steer_rows)} rows x "
+              f"{len(STEER_COLS)} cols"
+              f"{' (shared across rows)' if self.share else ''}, "
+              f"chunk {self.chunk_secs * 1000:.0f}ms, step {2 * self.chunk_secs * 1000:.0f}ms, "
+              f"base_noise {'frozen' if self.freeze_noise else 'per-episode'}", flush=True)
 
     # ---------- task server ----------
 
@@ -99,14 +130,26 @@ class StackEnv:
         w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
         yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
         yaw_feat = np.stack([np.cos(4 * yaw), np.sin(4 * yaw)], axis=1).ravel()
-        return np.concatenate(
-            [state["joint_pos"], state["joint_vel"], *rel, *to_cubes,
-             contact, done_flags, yaw_feat, [state["pelvis_height"]]]
-        ).astype(np.float32)
+        parts = [state["joint_pos"], state["joint_vel"], *rel, *to_cubes,
+                 contact, done_flags, yaw_feat, [state["pelvis_height"]]]
+        if self.visual:
+            parts.append(self.last_visual)
+        return np.concatenate(parts).astype(np.float32)
+
+    def _update_visual(self, rec: dict) -> None:
+        """Project the backbone features into the observation slot.
+
+        Mean-pooled over tokens then L2-normalised before projecting, so the scale is
+        independent of however the backbone's activations happen to be distributed.
+        """
+        f = np.asarray(rec["backbone_features"], dtype=np.float32)
+        v = f.reshape(-1, f.shape[-1]).mean(0)
+        n = np.linalg.norm(v)
+        self.last_visual = (v / n if n > 1e-6 else v) @ self.visual_proj
 
     @property
     def obs_dim(self) -> int:
-        return 2 * N_JOINTS + 9 + 9 + 3 + 3 + 6 + 1
+        return 2 * N_JOINTS + 9 + 9 + 3 + 3 + 6 + 1 + self.visual_dim
 
     # ---------- lifecycle ----------
 
@@ -143,21 +186,54 @@ class StackEnv:
         is the only part carrying information, and makes every actor output an
         in-distribution seed.
         """
-        # No coordinate clip: the actor is unsquashed now, and clipping to (-1,1)
-        # would truncate exactly the tails that make the seed look Gaussian. The
-        # norm projection below is the only bound the seed needs.
+        # Per-coordinate box, as in the reference: the actor's tanh output in (-1,1)
+        # scaled to (-noise_scale, +noise_scale). No norm projection -- that was our
+        # own construction and the reference imposes no such constraint.
         steer = np.asarray(action, dtype=np.float32)
         if self.share:
-            # One value per joint, repeated down the chunk. Broadcast BEFORE the
-            # projection so the norm is set in the 224-dim space the model reads,
-            # not in the 14-dim space the actor writes.
-            steer = np.tile(steer, (len(STEER_ROWS), 1))
-        steer = steer.reshape(len(STEER_ROWS), len(STEER_COLS))
-        radius = np.sqrt(steer.size) * self.cfg.groot.noise_scale
-        steer = steer / max(np.linalg.norm(steer), 1e-6) * radius
+            steer = np.tile(steer, (len(self.steer_rows), 1))
+        steer = np.clip(steer, -1.0, 1.0).reshape(len(self.steer_rows), len(STEER_COLS))
+        steer = steer * self.cfg.groot.noise_scale
         seed = self.base_noise.copy()
-        seed[0][np.ix_(STEER_ROWS, STEER_COLS)] = steer
+        seed[0][np.ix_(self.steer_rows, STEER_COLS)] = steer
         return seed
+
+    # ---------- noise aliasing ----------
+
+    def env_action(self, chunk: np.ndarray) -> np.ndarray:
+        """The executed part of a (40, 132) chunk, flattened: Q^A's action input.
+
+        Only the rows the client executes and the 35 live columns; the rest is either
+        discarded before reaching the robot or constant for this embodiment.
+        """
+        return np.asarray(chunk, dtype=np.float32)[
+            np.ix_(self.steer_rows, np.arange(self.cfg.groot.live_action_dim))
+        ].ravel()
+
+    @property
+    def env_action_dim(self) -> int:
+        return len(self.steer_rows) * self.cfg.groot.live_action_dim
+
+    def _collect_pairs(self, cand_noise):
+        """Pull this step's feedback and pair each candidate seed with its action.
+
+        Best-effort: the client publishes without blocking, so a missing record just
+        means this state is not used for distillation (NaReplayBuffer tracks that).
+        """
+        self.feedback.drain()
+        rec = self.feedback.get(self.step_index)
+        if rec is not None and self.visual and "backbone_features" in rec:
+            self._update_visual(rec)
+        if rec is None or "dsrl_candidate_actions" not in rec:
+            return {"na_pairs": None}
+        cand_actions = np.asarray(rec["dsrl_candidate_actions"], dtype=np.float32)
+        n = min(len(cand_noise), len(cand_actions))
+        out = {"na_pairs": (cand_noise[:n],
+                            np.stack([self.env_action(a) for a in cand_actions[:n]]))}
+        if "action_pred" in rec:
+            out["env_action"] = self.env_action(np.asarray(rec["action_pred"],
+                                                          dtype=np.float32)[0])
+        return out
 
     # ---------- termination ----------
 
@@ -196,7 +272,19 @@ class StackEnv:
             truncated = self.chunks >= self.cfg.env.max_chunks or elapsed > self.cfg.env.max_secs
             return self.observation(state), reward, done, truncated, info
 
-        self.seeds.send(self._build_seed(action), step=self.step_index)
+        cand_noise = None
+        if self.na:
+            # Candidates are drawn the way the base policy draws noise: clipped
+            # standard normal, matching their collect_rollouts. Q^W must learn the
+            # value of noise the policy could plausibly receive, and the distillation
+            # deliberately covers tails the actor itself cannot reach.
+            mag = self.cfg.groot.noise_scale
+            z = self.rng.standard_normal((self.k_pairs, self.action_dim))
+            cand_noise = np.clip(z, -mag, mag).astype(np.float32) / mag
+            extra = np.stack([self._build_seed(c)[0] for c in cand_noise])
+        self.seeds.send(self._build_seed(action), step=self.step_index,
+                        extra=extra if self.na else None,
+                        feat=self.na or self.visual)
         # First ack: the client consumed this seed, so the chunk begins now.
         used = self.seeds.wait_ack(self.step_index, timeout=self.cfg.env.ack_timeout_secs)
         # Second ack: the client queried again, so a full chunk of this seed has
@@ -214,6 +302,9 @@ class StackEnv:
         info["seed_used"] = used
         elapsed = time.monotonic() - self.t0
         info["elapsed"] = round(elapsed, 1)
+
+        if self.na or self.visual:
+            info.update(self._collect_pairs(cand_noise))
 
         done, truncated = self._terminate(info, elapsed)
         if not used:

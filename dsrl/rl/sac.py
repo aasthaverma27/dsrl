@@ -12,32 +12,35 @@ import torch.nn.functional as F
 
 LOG_STD_MIN, LOG_STD_MAX = -5.0, 2.0
 
-def mlp(sizes, out_dim, layer_norm=False):
-    """layer_norm is the practical fix for high-UTD critics: without it the actor
-    exploits unbounded extrapolation on unseen actions and Q runs away."""
+def mlp(sizes, out_dim, layer_norm=False, activation="tanh"):
+    """Reference architecture: Tanh activation with LayerNorm after each linear, on
+    both actor and critic (train_dsrl.py passes activation_fn=nn.Tanh and
+    post_linear_modules=[LayerNorm] via net_arch=dict(pi=..., qf=...))."""
+    act = {"tanh": nn.Tanh, "relu": nn.ReLU}[activation]
     layers, last = [], sizes[0]
     for h in sizes[1:]:
         layers.append(nn.Linear(last, h))
         if layer_norm:
             layers.append(nn.LayerNorm(h))
-        layers.append(nn.ReLU())
+        layers.append(act())
         last = h
     layers.append(nn.Linear(last, out_dim))
     return nn.Sequential(*layers)
 
 class Actor(nn.Module):
-    def __init__(self, obs_dim, act_dim, hidden):
+    def __init__(self, obs_dim, act_dim, hidden, layer_norm=True, activation="tanh"):
         super().__init__()
-        self.net = mlp([obs_dim, *hidden], 2 * act_dim)
+        self.net = mlp([obs_dim, *hidden], 2 * act_dim,
+                       layer_norm=layer_norm, activation=activation)
         self.act_dim = act_dim
         # Start the composite policy AT the base policy. DSRL's guarantee that the
         # optimum is no worse than the frozen policy holds because feeding i.i.d.
         # N(0,1) reproduces it exactly -- but only if that point is reachable and,
         # in practice, only helps if we start there. Zeroing the output layer gives
-        # mu=0 and log_std=0, so the initial seed is a state-independent isotropic
-        # draw: the frozen policy's own noise distribution. A random init instead
-        # begins at an arbitrary state-dependent point on the shell and has to climb
-        # back to baseline before it can improve on it.
+        # mu=0 and log_std=0, so the initial policy is a state-independent draw.
+        # log_std=0 also matches the reference's log_std_init=0.0. A random init
+        # instead begins at an arbitrary state-dependent point and has to climb back
+        # to baseline before it can improve on it.
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
@@ -46,33 +49,31 @@ class Actor(nn.Module):
         return mu, log_std.clamp(LOG_STD_MIN, LOG_STD_MAX)
 
     def sample(self, obs):
-        """No tanh squash: the action IS noise, and noise is Gaussian, not bounded.
+        """Tanh-squashed Gaussian over the box, as in the reference.
 
-        Squashing capped each coordinate at +/-1.6 where real noise reaches +/-3.5
-        (kurtosis 1.63 vs 3.02) and the frozen policy scored 0/3 on it while the
-        same-norm unsquashed distribution scored 1.92/3. Unsquashed also keeps the
-        seed exactly Gaussian for any mu and std, so steering shifts the mean
-        without ever deforming the shape. The shell projection in _build_seed is
-        what bounds the action instead.
+        Their noise space is Box(-action_magnitude, +action_magnitude) with a standard
+        SAC actor (env_utils.py:199-200), and _build_seed scales this output by
+        noise_scale=1.5. Removing the squash and projecting onto a norm shell was our
+        own construction, not theirs.
         """
         mu, log_std = self(obs)
-        normal = torch.distributions.Normal(mu, log_std.exp())
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mu, std)
         x = normal.rsample()
-        return x, normal.log_prob(x).sum(-1, keepdim=True)
+        action = torch.tanh(x)
+        # tanh change-of-variables correction
+        logp = normal.log_prob(x) - torch.log(1 - action.pow(2) + 1e-6)
+        return action, logp.sum(-1, keepdim=True)
 
 
 class Critic(nn.Module):
-    """Ensemble of num_critics Q heads.
+    """Ensemble of num_critics Q heads; the reference uses 2 with a `min` backup."""
 
-    High UTD with only two critics diverges: 20 gradient steps per env step
-    overfits a small buffer and each overestimate feeds back through the target.
-    Averaging over an ensemble is what makes cfg.utd=20 stable.
-    """
-
-    def __init__(self, obs_dim, act_dim, hidden, num_critics=10):
+    def __init__(self, obs_dim, act_dim, hidden, num_critics=2, activation="tanh"):
         super().__init__()
         self.qs = nn.ModuleList(
-            [mlp([obs_dim + act_dim, *hidden], 1, layer_norm=True) for _ in range(num_critics)]
+            [mlp([obs_dim + act_dim, *hidden], 1, layer_norm=True, activation=activation)
+             for _ in range(num_critics)]
         )
 
     def forward(self, obs, act):
@@ -108,9 +109,11 @@ class SAC:
         n_q = cfg.num_critics
         self.reduction = cfg.critic_reduction
         self.subset_size = getattr(cfg, "critic_subset_size", 2)
-        self.actor = Actor(obs_dim, act_dim, hidden).to(self.device)
-        self.critic = Critic(obs_dim, act_dim, hidden, n_q).to(self.device)
-        self.critic_target = Critic(obs_dim, act_dim, hidden, n_q).to(self.device)
+        act_fn = getattr(cfg, "activation", "tanh")
+        ln_actor = getattr(cfg, "layer_norm_actor", True)
+        self.actor = Actor(obs_dim, act_dim, hidden, ln_actor, act_fn).to(self.device)
+        self.critic = Critic(obs_dim, act_dim, hidden, n_q, act_fn).to(self.device)
+        self.critic_target = Critic(obs_dim, act_dim, hidden, n_q, act_fn).to(self.device)
         self.critic_target.load_state_dict(self.critic.state_dict())
 
         self.actor_opt = torch.optim.Adam(self.actor.parameters(), lr=cfg.lr)
@@ -165,7 +168,7 @@ class SAC:
         o = torch.as_tensor(obs, device=self.device).unsqueeze(0)
         if deterministic:
             mu, _ = self.actor(o)
-            return mu.squeeze(0).cpu().numpy()
+            return torch.tanh(mu).squeeze(0).cpu().numpy()
         a, _ = self.actor.sample(o)
         return a.squeeze(0).cpu().numpy()
 

@@ -10,6 +10,7 @@ import tyro
 from dsrl.config import DsrlConfig
 from dsrl.env.stack_env import StackEnv
 from dsrl.rl.sac import SAC
+from dsrl.rl.sac_na import SacNA
 
 @dataclass(frozen=True)
 class TrainArgs:
@@ -44,8 +45,12 @@ def main(args: TrainArgs) -> None:
     (log_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2, default=str))
 
     env = StackEnv(cfg, seed=args.seed)
-    agent = SAC(env.obs_dim, env.action_dim, cfg.sac)
-    print(f"[INFO] obs_dim={env.obs_dim} action_dim={env.action_dim}")
+    if cfg.sac.use_noise_aliasing:
+        agent = SacNA(env.obs_dim, env.action_dim, env.env_action_dim, cfg.sac)
+    else:
+        agent = SAC(env.obs_dim, env.action_dim, cfg.sac)
+    print(f"[INFO] obs_dim={env.obs_dim} action_dim={env.action_dim}"
+          + (f" env_action_dim={env.env_action_dim}" if cfg.sac.use_noise_aliasing else ""))
 
     if args.resume is not None:
         ckpt = torch.load(args.resume, map_location=agent.device)
@@ -168,15 +173,25 @@ def main(args: TrainArgs) -> None:
 
     for step in range(args.steps):
         if step < cfg.sac.warmup_transitions:
-            # Exactly the frozen policy's own noise: the action space is now raw
-            # noise space, so warmup and the actor's init sample the same
-            # distribution and warmup returns should match the baseline.
-            action = np.random.standard_normal(env.action_dim).astype(np.float32)
+            # The reference's collect_rollouts: sample standard normal, clip each
+            # coordinate to +/-action_magnitude, and store scale_action(noise), i.e.
+            # noise/action_magnitude, so the stored action lives in (-1,1).
+            # Dividing here means _build_seed's *noise_scale exactly undoes it, so
+            # the seed written is a clipped standard normal draw.
+            mag = cfg.groot.noise_scale
+            z = np.random.standard_normal(env.action_dim)
+            action = (np.clip(z, -mag, mag) / mag).astype(np.float32)
         else:
             action = agent.act(obs)
 
         next_obs, reward, done, truncated, info = env.step(action)
-        agent.buffer.add(obs, action, reward, next_obs, float(done and not truncated))
+        terminal = float(done and not truncated)
+        if cfg.sac.use_noise_aliasing:
+            pw, pa = info.get("na_pairs") or (None, None)
+            agent.buffer.add(obs, action, reward, next_obs, terminal,
+                             info.get("env_action"), pw, pa)
+        else:
+            agent.buffer.add(obs, action, reward, next_obs, terminal)
         cur_ep.append((obs, action, reward))
 
         obs = next_obs
@@ -186,9 +201,23 @@ def main(args: TrainArgs) -> None:
         if agent.buffer.size >= cfg.sac.warmup_transitions:
             for _ in range(cfg.sac.utd):
                 metrics = agent.update(cfg.sac.batch_size)
+            if cfg.sac.use_noise_aliasing:
+                # Q^W's regression against Q^A, mirroring their separate loop after
+                # the main updates (dsrl.py runs noise_critic_grad_steps here).
+                metrics.update(agent.distill())
+
+        phase = "warmup" if step < cfg.sac.warmup_transitions else "train"
+
+        # Every step that paid anything, itemised. This is the signal the policy is
+        # actually learning from, so it should be visible as it happens rather than
+        # summarised into one scalar.
+        if info["step_terms"]:
+            paid = "  ".join(f"{k}={v:+.1f}(cube {info['events'][k]})"
+                             for k, v in info["step_terms"].items())
+            print(f"    >>> ep{episode:3d} step {step:5d}  {paid}   "
+                  f"step_total={reward:+.1f}  episode_total={ep_return:+.1f}", flush=True)
 
         if step % 10 == 0:
-            phase = "warmup" if step < cfg.sac.warmup_transitions else "train"
             print(f"  [{phase}] step {step:5d} ep{episode:3d} step_reward={reward:+6.2f} "
                   f"episode_reward={ep_return:+7.2f} correct={info['correct']} "
                   f"q={metrics.get('q', 0.0):8.1f} alpha={metrics.get('alpha', 0.0):.3f} "
@@ -201,12 +230,34 @@ def main(args: TrainArgs) -> None:
             cal = {}
             if metrics and len(recent_eps) >= args.calibrate_episodes:
                 cal = calibration(agent, recent_eps, cfg.sac.gamma)
+
+            # Full per-episode reward breakdown. Ordered by magnitude so the terms
+            # that actually moved the return are at the top, and the sum is checked
+            # against the accumulated return so accounting errors cannot hide.
+            terms = info["ep_terms"]
+            counts = info["ep_counts"]
+            width = max((len(k) for k in terms), default=12)
+            print(f"  {'-' * 58}")
+            print(f"  EPISODE {episode} REWARD BREAKDOWN   ({ep_len} steps, "
+                  f"{info['elapsed']}s, correct={info['correct']}/{cfg.env.n_cubes})")
+            for k, v in sorted(terms.items(), key=lambda kv: -abs(kv[1])):
+                print(f"    {k:<{width}}  {v:+8.2f}   x{counts[k]:<3d}"
+                      f"  ({v / counts[k]:+.2f} each)")
+            if not terms:
+                print("    (nothing paid this episode)")
+            print(f"    {'TOTAL':<{width}}  {sum(terms.values()):+8.2f}"
+                  f"   (accumulated {ep_return:+.2f})")
+            print(f"  {'-' * 58}", flush=True)
             log({"step": step, "episode": episode, "episode_reward": round(ep_return, 2),
                  "correct": info["correct"], "wrong": info["wrong"],
                  "fell": info["fell"], "len": ep_len,
                  "elapsed": info["elapsed"], "stalled": info.get("stalled", False),
                  "early": info.get("ended_early", False),
                  "events": sorted(info["events"].keys()),
+                 # per-term totals, so reward composition is analysable after the run
+                 # rather than only visible in the terminal
+                 "ep_terms": {k: round(v, 2) for k, v in info["ep_terms"].items()},
+                 "ep_counts": info["ep_counts"],
                  **cal,
                  **{k: round(v, 4) for k, v in metrics.items()}})
             obs = reset_env()
