@@ -16,9 +16,10 @@ episodes each).
 | frozen GR00T N1.7 (its own noise) | 78.9 % | 48.3 % | 0 |
 | **+ DSRL** | **88.9 %** | **78.3 %** | 0 |
 
-Rollouts: [champion](results/videos/champion_rollout.mp4) ·
-[native](results/videos/native_rollout.mp4). Details, files and caveats:
-[results/README.md](results/README.md).
+<p align="center"><img src="results/figures/rollout_comparison.gif" width="760"></p>
+<p align="center"><sub>The robot's head camera on a held-out seed, one frame per action chunk (8 fps). Left: frozen GR00T with its own noise. Right: the same frozen GR00T steered by DSRL, which finishes in 53 chunks against 68. Both episodes happen to place all three cubes; the difference DSRL makes is how often that happens (78 % vs 48 % of episodes). Full-resolution videos: <a href="results/videos/native_rollout.mp4">native</a> · <a href="results/videos/champion_rollout.mp4">DSRL</a>.</sub></p>
+
+Details, files and caveats: [results/README.md](results/README.md).
 
 ## How it works
 

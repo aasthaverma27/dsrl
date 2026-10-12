@@ -31,6 +31,7 @@ action head is chosen by the learned agent.
 | `figures/plot_champion_lineage.png` | 10-episode training evaluations of the champion and its forks; note how far they swing |
 | `figures/plot_critic_health.png` | critic calibration before and after the pessimism fix (round 1 vs round 2) |
 | `videos/champion_rollout.mp4`, `native_rollout.mp4` | the robot's ego camera on a held-out seed, one frame per chunk |
+| `figures/rollout_comparison.gif` | the two videos side by side, for the main README |
 
 Each episode line: `{"ep", "correct", "wrong", "fell", "chunks"}`.
 
