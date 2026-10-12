@@ -1,0 +1,589 @@
+diff --git a/decoupled_wbc/control/utils/hand_grasp_smoother.py b/decoupled_wbc/control/utils/hand_grasp_smoother.py
+new file mode 100644
+index 0000000..74664bb
+--- /dev/null
++++ b/decoupled_wbc/control/utils/hand_grasp_smoother.py
+@@ -0,0 +1,250 @@
++"""
++Online causal smoothing of the right-hand grasp at data-collection time.
++
++Port of the offline v5/v6 grasp smoother (Melvin_ws/scripts/smooth_bang_bang_v5.py,
++Melvin_ws/apply_v6_smoothing.py) into the live control loop, so the smoothing
++happens where the data is created instead of as post-hoc label surgery:
++
++  * the robot executes the smoothed hand command
++      -> measured observation.state is REAL and naturally consistent (no offline
++         servo-model regeneration needed), and
++  * the recorded `action` label is the same smoothed command the robot executed
++      -> no train/deploy distribution shift.
++
++Only the right-hand joints (36..42, Dex3) are touched. The per-joint limits are
++v5's DMAX (rad/tick @ 20 Hz) expressed as a max velocity in rad/s:
++
++    DMAX = {36:0.30, 37:0.30, 38:0.30, 39:0.30, 40:0.20, 41:0.25, 42:0.25} rad/tick
++    -> {36:6.0, 37:6.0, 38:6.0, 39:6.0, 40:4.0, 41:5.0, 42:5.0} rad/s
++
++which sits inside the measured finger envelope (~4.7-9 rad/s).
++
++Profile generator: instead of the offline corner-rounding (zero-phase gaussian,
++Savitzky-Golay), which is non-causal and cannot run online, each hand joint runs
++a jerk-limited (S-curve) motion profile with provable bounds:
++
++    max velocity  = per-joint DMAX above
++    max accel     = 30 rad/s^2
++    max jerk      = 300 rad/s^3
++
++Every control tick the profile is replanned from the current (q, v, a) state to
++the latest target ("reflex" replanning), which makes it naturally handle moving
++targets and direction reversals without ever looking ahead. A hard per-tick slew
++clamp (|dq| <= DMAX*dt) is kept as a backstop.
++
++Trade-off vs the previous slew+EMA version: accel/decel ramps add a little time
++to a full close (~0.5 s for 1.5 rad vs ~0.25 s) in exchange for bounded jerk.
++"""
++
++import numpy as np
++
++RIGHT_HAND_JOINTS = np.arange(36, 43)
++DMAX_RADPS = np.array([6.0, 6.0, 6.0, 6.0, 4.0, 5.0, 5.0])
++
++
++class HandGraspSmoother:
++    """Per-joint jerk-limited S-curve profile for the right-hand grasp.
++
++    Stateful: must be called once per control tick with the full 43-dim joint
++    target (or any array whose indices 36..42 are the right-hand joints). Smooths
++    the hand joints in place and returns the same array.
++
++    Each joint keeps its own scalar trajectory state (q, v, a). Per tick:
++
++      1. target error d = target - q is read (may move arbitrarily; teleop).
++      2. a stopping-feasibility check decides whether to accelerate toward the
++         target or to start/continue the maximum-jerk deceleration, such that the
++         joint stops exactly at the target (reflex replan -> time-optimal and
++         jerk-bounded S-curve, no overshoot for a fixed target).
++      3. q is integrated with the commanded accel, velocity-clamped to the
++         per-joint DMAX, and a hard slew backstop clips the per-tick step.
++    """
++
++    def __init__(
++        self,
++        dt: float,
++        dmax_radps=DMAX_RADPS,
++        max_acc: float = 30.0,
++        max_jerk: float = 300.0,
++        d_tol: float = 1e-3,
++        v_tol: float = 0.02,
++        max_stop_iters: int = 400,
++    ):
++        self.dt = float(dt)
++        self.dmax_radps = np.asarray(dmax_radps, dtype=float)
++        if self.dmax_radps.shape != (7,):
++            raise ValueError("dmax_radps must have 7 entries (right-hand joints 36..42)")
++        self.v_max = self.dmax_radps.copy()
++        self.a_max = float(max_acc)
++        self.j_max = float(max_jerk)
++        self.d_tol = float(d_tol)
++        self.v_tol = float(v_tol)
++        self.max_stop_iters = int(max_stop_iters)
++        self._q = None
++        self._v = None
++        self._a = None
++
++    def reset(self, q: np.ndarray) -> None:
++        """Re-seed the profile state from a measured/desired hand q (no initial jump)."""
++        q = np.asarray(q, dtype=float)
++        self._q = q[RIGHT_HAND_JOINTS].copy()
++        self._v = np.zeros(7)
++        self._a = np.zeros(7)
++
++    def _stop_dist(self, v: np.ndarray, a: np.ndarray) -> np.ndarray:
++        """Distance covered while stopping from (v, a) at max jerk then max accel.
++
++        Simulates the exact same discrete integration the main loop will execute,
++        so the feasibility check is self-consistent with the executed trajectory.
++        Works on the speed |v| with the accel component along the direction of
++        motion (a*sign(v)), so it is sign-correct for both travel directions and
++        always accumulates non-negative distances. Returns >= 0 for each joint;
++        joints with |v| <= v_tol contribute 0.
++        """
++        s = np.zeros(7)
++        vv = np.abs(v)
++        aa = a * np.sign(v)
++        done = np.zeros(7, dtype=bool)
++        for _ in range(self.max_stop_iters):
++            active = (~done) & (vv > self.v_tol)
++            if not active.any():
++                break
++            a_next = np.clip(aa - self.j_max * self.dt, -self.a_max, self.a_max)
++            v_next = vv + a_next * self.dt
++            crosses = active & (v_next <= 0.0) & (a_next < -1e-12)
++            if crosses.any():
++                t_stop = np.zeros(7)
++                t_stop[crosses] = -vv[crosses] / a_next[crosses]
++                s[crosses] += vv[crosses] * t_stop[crosses] + 0.5 * a_next[crosses] * t_stop[crosses] ** 2
++            keep = active & ~crosses
++            s[keep] += vv[keep] * self.dt + 0.5 * a_next[keep] * self.dt ** 2
++            upd = active & ~crosses
++            vv = np.where(upd, v_next, vv)
++            aa = np.where(upd, a_next, aa)
++            done |= active & crosses
++        return np.maximum(s, 0.0)
++
++    def smooth(self, q: np.ndarray) -> np.ndarray:
++        """Advance the jerk-limited S-curve one tick and write the hand joints of `q`."""
++        q = np.asarray(q, dtype=float)
++        if self._q is None:
++            self.reset(q)
++            return q
++
++        target = q[RIGHT_HAND_JOINTS]
++        v = self._v
++        a = self._a
++        q_prev = self._q
++
++        d = target - q_prev
++        d_abs = np.abs(d)
++        v_abs = np.abs(v)
++
++        settle = (d_abs <= self.d_tol) & (v_abs <= self.v_tol)
++        moving = v_abs > self.v_tol
++        at_target = d_abs <= self.d_tol
++        toward = d * v > 0.0
++
++        # Greedy one-tick feasibility: pick j in {+J, 0, -J} so that the state
++        # left after this tick is still inside the reachable set, i.e. its max-
++        # jerk stopping distance fits in the distance that remains after this
++        # tick's travel. The reachable set certificate is _stop_dist(v, a) <= d,
++        # and since the certificate is re-checked every tick, any trajectory that
++        # stays feasible provably reaches the target (no overshoot, no reliance
++        # on the arrival guard).
++        dir_toward = np.where(d >= 0.0, 1.0, -1.0)
++
++        # Arrival speed bound: if a candidate reaches the target this tick, the
++        # position guard below will zero the remaining velocity in a single tick
++        # (stored a = -v/dt, jerk = -v/dt^2), so arriving at more than v_arr
++        # would exceed the jerk limit. Reject fast landing steps; this forces the
++        # profile to slow to <= v_arr before the final approach.
++        v_arr = self.j_max * self.dt ** 2
++        land_eps = self.d_tol * 1e-3
++
++        a_acc = np.clip(a + dir_toward * self.j_max * self.dt, -self.a_max, self.a_max)
++        v_acc = np.clip(v + a_acc * self.dt, -self.v_max, self.v_max)
++        rem_acc = d_abs - np.abs(v_acc) * self.dt
++        accel_ok = ((rem_acc <= land_eps) & (np.abs(v_acc) <= v_arr)) | \
++                   (self._stop_dist(v_acc, a_acc) <= rem_acc)
++
++        v_hold = np.clip(v + a * self.dt, -self.v_max, self.v_max)
++        rem_hold = d_abs - np.abs(v_hold) * self.dt
++        hold_ok = ((rem_hold <= land_eps) & (np.abs(v_hold) <= v_arr)) | \
++                  (self._stop_dist(v_hold, a) <= rem_hold)
++
++        # Decelerate only when neither accelerating nor holding keeps us feasible;
++        # this is what sheds the accel at exactly the right moment. Once engaged,
++        # the decel command tracks the exact-landing law a_target = -v^2/(2d)
++        # (jerk-limited ramp) instead of bang-bang max braking: max braking from
++        # the latest-feasible switch point always over-brakes the low-speed tail,
++        # stranding the joint short of the target and then re-creeping (each
++        # transition a jerk spike). The landing law returns a to ~0 as v and d
++        # shrink together, so the profile ends at v ~= 0 exactly on the target.
++        decel = moving & (~accel_ok) & (~hold_ok)
++        decel |= moving & at_target
++        hold = moving & (~accel_ok) & hold_ok & (~at_target)
++        accel = accel_ok & (~at_target)
++
++        a_land = -dir_toward * np.minimum(
++            v_abs * v_abs / (2.0 * np.maximum(d_abs, self.d_tol)), self.a_max)
++        a_cmd = np.zeros(7)
++        a_cmd = np.where(accel, a + dir_toward * self.j_max * self.dt, a_cmd)
++        a_cmd = np.where(decel, a + np.clip(a_land - a, -self.j_max * self.dt,
++                                            self.j_max * self.dt), a_cmd)
++        a_cmd = np.where(hold, a, a_cmd)
++
++        # Bleed leftover accel: if the joint stopped short of the target with a
++        # deep accel still stored (v=0, d>d_tol), ramp it toward 0 at max jerk
++        # instead of letting a_cmd fall to 0 (which would be a jerk spike). The
++        # direction guard below keeps position pinned while the accel bleeds.
++        stopped_short = (v_abs <= self.v_tol) & (d_abs > self.d_tol) & \
++                        (np.abs(a) > self.j_max * self.dt)
++        a_cmd = np.where(stopped_short, a - np.sign(a) * self.j_max * self.dt, a_cmd)
++
++        # Settle at the target: pin v to 0 so the trajectory goes flat. No accel
++        # "bleed" here (a nonzero command while v ~= 0 would push q away from the
++        # target); any leftover accel is simply dropped since only q is recorded.
++        a_settle = np.clip(-v / self.dt, -self.a_max, self.a_max)
++        a_cmd = np.where(settle, a_settle, a_cmd)
++
++        # Integrate. Ease off accel as v approaches the per-joint ceiling so a
++        # returns to 0 exactly as v reaches v_max (jerk-bounded: a is shed at
++        # max jerk J, which from a=A takes A/J s and gains A^2/(2J) of velocity,
++        # so the shed starts at v_max - a^2/(2J)). A hard proportional cap on a
++        # would otherwise produce jerk up to a/dt at the start of cruise.
++        a_cmd = np.where(
++            (~decel) & (v_abs >= self.v_max - a * a / (2.0 * self.j_max)) & (a * dir_toward > 0.0),
++            a - dir_toward * self.j_max * self.dt,
++            a_cmd,
++        )
++        a_lim = a_cmd.copy()
++        a_lim = np.where(a_cmd > 0.0, np.minimum(a_lim, (self.v_max - v) / self.dt), a_lim)
++        a_lim = np.where(a_cmd < 0.0, np.maximum(a_lim, (-self.v_max - v) / self.dt), a_lim)
++        a_lim = np.clip(a_lim, -self.a_max, self.a_max)
++
++        v_cmd = v + a_lim * self.dt
++        v_cmd = np.clip(v_cmd, -self.v_max, self.v_max)
++
++        # Arrival guards: never step past the current target, and never let an
++        # over-aggressive command push velocity through zero while the joint is
++        # still approaching (this is what used to cause arrival overshoot/ring).
++        pos = d >= 0.0
++        neg = d < 0.0
++        v_cmd = np.where(pos, np.minimum(v_cmd, d / self.dt), v_cmd)
++        v_cmd = np.where(neg, np.maximum(v_cmd, d / self.dt), v_cmd)
++        v_cmd = np.where(pos & (v >= 0.0), np.maximum(v_cmd, 0.0), v_cmd)
++        v_cmd = np.where(neg & (v <= 0.0), np.minimum(v_cmd, 0.0), v_cmd)
++
++        q_cmd = q_prev + v_cmd * self.dt
++
++        # Hard slew backstop: never step more than DMAX*dt per tick.
++        q_cmd = np.clip(q_cmd, q_prev - self.dmax_radps * self.dt,
++                        q_prev + self.dmax_radps * self.dt)
++
++        v_cmd = (q_cmd - q_prev) / self.dt
++        self._q = q_cmd
++        self._v = v_cmd
++        self._a = (v_cmd - v) / self.dt
++        q[RIGHT_HAND_JOINTS] = q_cmd
++        return q
+diff --git a/gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml b/gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml
+index 76110b5..6474036 100644
+--- a/gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml
++++ b/gear_sonic/data/robot_model/model_data/g1/g1_29dof_with_hand.xml
+@@ -222,7 +222,6 @@
+           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1"
+             mesh="waist_roll_link" />
+           <body name="torso_link" pos="0 0 0.019">
+-            <camera name="head_camera" pos="0.06 0.0 0.45" euler="0 -0.8 -1.57"/>
+             <inertial pos="0.00331658 0.000261533 0.179856"
+               quat="0.999831 0.000376204 0.0179895 -0.00377704" mass="9.598"
+               diaginertia="0.12407 0.111951 0.0325382" />
+@@ -243,6 +242,13 @@
+             <geom pos="0.0039635 0 -0.054" quat="1 0 0 0" type="mesh" rgba="0.7 0.7 0.7 1"
+               mesh="waist_support_link" />
+             <site name="imu" size="0.01" pos="-0.03959 -0.00224 0.13792" />
++
++             <camera
++             name="ego_view"
++             pos="0.07 0 0.36"
++             euler="0 -0.80 -1.57"
++             fovy="100"
++             />
+             <body name="left_shoulder_pitch_link" pos="0.0039563 0.10022 0.23778"
+               quat="0.990264 0.139201 1.38722e-05 -9.86868e-05">
+               <inertial pos="0 0.035892 -0.011628" quat="0.654152 0.0130458 -0.326267 0.68225"
+@@ -301,6 +307,13 @@
+                           rgba="0.7 0.7 0.7 1" mesh="left_wrist_pitch_link" />
+                         <geom type="mesh" rgba="0.7 0.7 0.7 1" mesh="left_wrist_pitch_link" />
+                         <body name="left_wrist_yaw_link" pos="0.046 0 0">
++                           <camera
++                            name="ego_view_left_mono"
++                            pos="0.20 0.0 0.12"
++                            euler="0 0.5 0"
++                            fovy="80"
++                            mode="fixed"
++                          />
+                           <inertial pos="0.0885506 0.00212216 -0.000374562"
+                             quat="0.487149 0.493844 0.513241 0.505358" mass="0.457415"
+                             diaginertia="0.00105989 0.000895419 0.000323842" />
+@@ -452,6 +465,13 @@
+                           rgba="0.7 0.7 0.7 1" mesh="right_wrist_pitch_link" />
+                         <geom type="mesh" rgba="0.7 0.7 0.7 1" mesh="right_wrist_pitch_link" />
+                         <body name="right_wrist_yaw_link" pos="0.046 0 0">
++                           <camera
++                            name="ego_view_right_mono"
++                            pos="0.20 0.0 0.12"
++                            euler="0 0.5 0"
++                            fovy="80"
++                            mode="fixed"
++                          />
+                           <inertial pos="0.0885506 -0.00212216 0.000573742"
+                             quat="0.507224 0.511377 0.494292 0.486717" mass="0.457415"
+                             diaginertia="0.0010598 0.000895373 0.0003238" />
+diff --git a/gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml b/gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml
+index d66b23d..871cbae 100644
+--- a/gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml
++++ b/gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml
+@@ -15,6 +15,11 @@
+     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+       markrgb="0.8 0.8 0.8" width="300" height="300"/>
+     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
++    <!-- Colored materials for baskets and matching cubes -->
++    <material name="mat_red" rgba="0.85 0.12 0.12 1"/>
++    <material name="mat_green" rgba="0.12 0.70 0.18 1"/>
++    <material name="mat_blue" rgba="0.15 0.25 0.85 1"/>
++    <material name="mat_table" rgba="0.55 0.40 0.26 1"/>
+   </asset>
+ 
+   <worldbody>
+@@ -22,6 +27,59 @@
+     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+     <!-- Site -->
+     <site name="com_marker" pos="0.1 0 0" size="0.05" rgba="1 0 0 1" type="sphere"/>
++
++    <!-- ==================== Manipulation scene ==================== -->
++    <!-- Robot faces +x, so the table and objects are placed in front (+x). -->
++
++    <!-- Table: static. Top surface at z = 0.76 m, centered at x = 0.55 m. -->
++    <body name="table" pos="0.41 0 0">
++      <geom name="table_top" type="box" size="0.35 0.45 0.02" pos="0 0 0.74" material="mat_table"/>
++      <geom name="table_leg_fl" type="box" size="0.02 0.02 0.36" pos="0.30 0.40 0.36" material="mat_table"/>
++      <geom name="table_leg_fr" type="box" size="0.02 0.02 0.36" pos="0.30 -0.40 0.36" material="mat_table"/>
++      <geom name="table_leg_bl" type="box" size="0.02 0.02 0.36" pos="-0.30 0.40 0.36" material="mat_table"/>
++      <geom name="table_leg_br" type="box" size="0.02 0.02 0.36" pos="-0.30 -0.40 0.36" material="mat_table"/>
++    </body>
++
++    <!-- Baskets: FIXED positions, back row at x = 0.68 m, sitting on the table top (z = 0.76). -->
++    <!-- Each basket is an open-top container (floor + 4 walls). -->
++    <body name="basket_red" pos="0.33 -0.13 0.76">
++      <geom name="basket_red_floor" type="box" size="0.06 0.06 0.005" pos="0 0 0.005" material="mat_red"/>
++      <geom name="basket_red_wpx" type="box" size="0.005 0.06 0.03" pos="0.055 0 0.035" material="mat_red"/>
++      <geom name="basket_red_wnx" type="box" size="0.005 0.06 0.03" pos="-0.055 0 0.035" material="mat_red"/>
++      <geom name="basket_red_wpy" type="box" size="0.06 0.005 0.03" pos="0 0.055 0.035" material="mat_red"/>
++      <geom name="basket_red_wny" type="box" size="0.06 0.005 0.03" pos="0 -0.055 0.035" material="mat_red"/>
++    </body>
++    <body name="basket_green" pos="0.33 0.0 0.76">
++      <geom name="basket_green_floor" type="box" size="0.06 0.06 0.005" pos="0 0 0.005" material="mat_green"/>
++      <geom name="basket_green_wpx" type="box" size="0.005 0.06 0.03" pos="0.055 0 0.035" material="mat_green"/>
++      <geom name="basket_green_wnx" type="box" size="0.005 0.06 0.03" pos="-0.055 0 0.035" material="mat_green"/>
++      <geom name="basket_green_wpy" type="box" size="0.06 0.005 0.03" pos="0 0.055 0.035" material="mat_green"/>
++      <geom name="basket_green_wny" type="box" size="0.06 0.005 0.03" pos="0 -0.055 0.035" material="mat_green"/>
++    </body>
++    <body name="basket_blue" pos="0.33 0.13 0.76">
++      <geom name="basket_blue_floor" type="box" size="0.06 0.06 0.005" pos="0 0 0.005" material="mat_blue"/>
++      <geom name="basket_blue_wpx" type="box" size="0.005 0.06 0.03" pos="0.055 0 0.035" material="mat_blue"/>
++      <geom name="basket_blue_wnx" type="box" size="0.005 0.06 0.03" pos="-0.055 0 0.035" material="mat_blue"/>
++      <geom name="basket_blue_wpy" type="box" size="0.06 0.005 0.03" pos="0 0.055 0.035" material="mat_blue"/>
++      <geom name="basket_blue_wny" type="box" size="0.06 0.005 0.03" pos="0 -0.055 0.035" material="mat_blue"/>
++    </body>
++
++    <!-- Cubes: 7 cm, physical (freejoint), resting on the table (z = 0.795). These -->
++    <!-- start positions are tuned for the robot's arm reach; on every reset the cubes -->
++    <!-- are shuffled across these positions (permutation) + jittered within +/-5 cm. -->
++    <!-- See randomize_cubes. -->
++    <body name="cube_red" pos="0.2 -0.1 0.795">
++      <freejoint name="cube_red_free"/>
++      <geom name="cube_red_geom" type="box" size="0.035 0.035 0.035" material="mat_red"/>
++    </body>
++    <body name="cube_green" pos="0.2 0.0 0.795">
++      <freejoint name="cube_green_free"/>
++      <geom name="cube_green_geom" type="box" size="0.035 0.035 0.035" material="mat_green"/>
++    </body>
++    <body name="cube_blue" pos="0.2 0.1 0.795">
++      <freejoint name="cube_blue_free"/>
++      <geom name="cube_blue_geom" type="box" size="0.035 0.035 0.035" material="mat_blue"/>
++    </body>
+   </worldbody>
+ 
+   <default>
+diff --git a/gear_sonic/utils/mujoco_sim/base_sim.py b/gear_sonic/utils/mujoco_sim/base_sim.py
+index fe8f4a0..b5ff334 100644
+--- a/gear_sonic/utils/mujoco_sim/base_sim.py
++++ b/gear_sonic/utils/mujoco_sim/base_sim.py
+@@ -53,8 +53,13 @@ class DefaultEnv:
+         self.camera_configs = camera_configs
+ 
+         if not camera_configs and offscreen and enable_image_publish:
++            # Publish keys must match the data/VLA pipeline feature names
++            # (observation.images.<key>); mjcf_name is the actual MuJoCo camera to
++            # render (see the <camera> tags in g1_29dof_with_hand.xml).
+             self.camera_configs = {
+-                "ego_view": {"height": 480, "width": 640, "mjcf_name": "head_camera"},
++                "ego_view": {"height": 480, "width": 640, "mjcf_name": "ego_view"},
++                "ego_left": {"height": 480, "width": 640, "mjcf_name": "ego_view_left_mono"},
++                "ego_right": {"height": 480, "width": 640, "mjcf_name": "ego_view_right_mono"},
+             }
+ 
+         self.reward_lock = Lock()
+@@ -184,6 +189,19 @@ class DefaultEnv:
+         # Enable the elastic band
+         if self.config["ENABLE_ELASTIC_BAND"] and self.use_floating_root_link:
+             self.elastic_band = ElasticBand()
++            # AUTO-RELEASE: an external SIGUSR1 releases the hanger, equivalent to pressing
++            # '9' in the GUI. Used by run_sim.sh to stand the robot without a GUI keypress.
++            # Harmless if the signal is never sent.
++            import signal as _signal
++
++            def _release_elastic_band(signum, frame):
++                self.elastic_band.enable = False
++                print("ElasticBand enable: False (via SIGUSR1)", flush=True)
++
++            try:
++                _signal.signal(_signal.SIGUSR1, _release_elastic_band)
++            except (ValueError, OSError):
++                pass  # not the main thread; auto-release unavailable
+             if "g1" in self.config["ROBOT_TYPE"]:
+                 if self.config["enable_waist"]:
+                     self.band_attached_link = self.mj_model.body("pelvis").id
+@@ -198,7 +216,7 @@ class DefaultEnv:
+                 self.viewer = mujoco.viewer.launch_passive(
+                     self.mj_model,
+                     self.mj_data,
+-                    key_callback=self.elastic_band.MujuocoKeyCallback,
++                    key_callback=self._viewer_key_callback,
+                     show_left_ui=False,
+                     show_right_ui=False,
+                 )
+@@ -208,7 +226,11 @@ class DefaultEnv:
+         else:
+             if self.onscreen:
+                 self.viewer = mujoco.viewer.launch_passive(
+-                    self.mj_model, self.mj_data, show_left_ui=False, show_right_ui=False
++                    self.mj_model,
++                    self.mj_data,
++                    key_callback=self._viewer_key_callback,
++                    show_left_ui=False,
++                    show_right_ui=False,
+                 )
+             else:
+                 mujoco.mj_forward(self.mj_model, self.mj_data)
+@@ -247,6 +269,100 @@ class DefaultEnv:
+         self.left_hand_index = np.array(self.left_hand_index)
+         self.right_hand_index = np.array(self.right_hand_index)
+ 
++        self._init_manipulation_cubes()
++
++    def _init_manipulation_cubes(self):
++        """Cache freejoint qpos addresses and initial poses for the colored cubes.
++
++        The cubes only exist in scenes that define them (e.g. scene_43dof.xml); if
++        the joints are absent this is a no-op so other scenes are unaffected.
++        """
++        # Reset handling: Backspace (from the viewer's UI thread) sets this flag,
++        # and sim_step detects any reset by the sim clock rewinding to 0.
++        self._reset_requested = False
++        self._prev_sim_time = 0.0
++
++        cube_joint_names = ["cube_red_free", "cube_green_free", "cube_blue_free"]
++        existing = [
++            n
++            for n in cube_joint_names
++            if mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, n) != -1
++        ]
++        if len(existing) != len(cube_joint_names):
++            self.cube_qpos_adr = None
++            return
++
++        # qpos address of each cube's freejoint (7 values: x,y,z, qw,qx,qy,qz).
++        self.cube_qpos_adr = [self.mj_model.joint(n).qposadr[0] for n in cube_joint_names]
++
++        # Each cube's initial pose, taken from the model (i.e. the body positions
++        # tuned in the scene XML for the robot's arm reach).
++        self.cube_init_qpos = [
++            self.mj_model.qpos0[adr : adr + 7].copy() for adr in self.cube_qpos_adr
++        ]
++        self.cube_xy_jitter = 0.05  # +/- 5 cm in x and y
++
++        # The 3 tuned start positions, ordered by y as slots A, B, C (nearest the
++        # red, green, blue baskets respectively).
++        slot_order = np.argsort([q[1] for q in self.cube_init_qpos])
++        self.cube_slot_qpos = [self.cube_init_qpos[i] for i in slot_order]
++
++        # Balanced schedule: cycle through all 3! = 6 cube->slot arrangements,
++        # EPISODES_PER_CONFIG episodes each (6 x 16 = 96), so every permutation is
++        # collected equally instead of relying on random sampling. Each tuple gives
++        # the cube index (red=0, green=1, blue=2) placed at slots (A, B, C).
++        self.cube_configs = [
++            (0, 1, 2),  # 1: A=red   B=green  C=blue
++            (0, 2, 1),  # 2: A=red   B=blue   C=green
++            (1, 0, 2),  # 3: A=green B=red    C=blue
++            (1, 2, 0),  # 4: A=green B=blue   C=red
++            (2, 0, 1),  # 5: A=blue  B=red    C=green
++            (2, 1, 0),  # 6: A=blue  B=green  C=red
++        ]
++        self.episodes_per_config = 16
++        self._episode_count = 0
++
++    def randomize_cubes(self):
++        """Place cubes per the balanced 6-config schedule, plus +/-5 cm jitter.
++
++        Cycles deterministically through all 6 cube arrangements (16 episodes each,
++        96 total) so every permutation is collected equally; the +/-5 cm x/y jitter
++        still varies within each episode. After 96 episodes the schedule repeats.
++        """
++        if getattr(self, "cube_qpos_adr", None) is None:
++            return
++
++        config_idx = (self._episode_count // self.episodes_per_config) % len(self.cube_configs)
++        config = self.cube_configs[config_idx]
++        for slot_idx, cube_idx in enumerate(config):
++            adr = self.cube_qpos_adr[cube_idx]
++            qpos = self.cube_slot_qpos[slot_idx].copy()
++            #qpos[0] += np.random.uniform(-self.cube_xy_jitter, self.cube_xy_jitter)
++            
++            #qpos[1] += np.random.uniform(-self.cube_xy_jitter, self.cube_xy_jitter)
++            self.mj_data.qpos[adr : adr + 7] = qpos
++
++        print(
++            f"[cube reset] episode {self._episode_count}, config {config_idx + 1}/6, "
++            f"cubes at (A,B,C) = {config}"
++        )
++        self._episode_count += 1
++
++    def _viewer_key_callback(self, keycode):
++        """Viewer key handler (runs on the viewer's UI thread).
++
++        Keep it minimal and thread-safe: only flip flags / scalar state here, and
++        let sim_step (physics thread) do the actual mjData work. Preserves the
++        elastic-band keys (7/8/9, including 9 = release from hanger).
++        """
++        import glfw
++
++        band = getattr(self, "elastic_band", None)
++        if band is not None:
++            band.MujuocoKeyCallback(keycode)
++        if keycode == glfw.KEY_BACKSPACE:
++            self._reset_requested = True
++
+     def init_renderers(self):
+         self.renderers = {}
+         for camera_name, camera_config in self.camera_configs.items():
+@@ -387,6 +503,19 @@ class DefaultEnv:
+         return obs
+ 
+     def sim_step(self):
++        # Backspace (captured on the viewer's UI thread) requests a reset; perform
++        # it here on the physics thread.
++        if self._reset_requested:
++            self._reset_requested = False
++            self.reset()
++        # Any reset (Backspace, fall, programmatic, or the viewer's built-in) rewinds
++        # the sim clock to 0. When we detect that, reshuffle the cubes so the scene
++        # changes on every reset.
++        if self.mj_data.time < self._prev_sim_time - 1e-9:
++            self.randomize_cubes()
++            mujoco.mj_forward(self.mj_model, self.mj_data)
++        self._prev_sim_time = self.mj_data.time
++
+         self.obs = self.prepare_obs()
+         self.unitree_bridge.PublishLowState(self.obs)
+         if self.unitree_bridge.joystick:
+@@ -524,6 +653,8 @@ class DefaultEnv:
+         return self_collision
+ 
+     def reset(self):
++        # Cube randomization is handled centrally by sim_step's reset detection
++        # (the sim clock rewinds to 0), which also covers the viewer's built-in reset.
+         mujoco.mj_resetData(self.mj_model, self.mj_data)
+ 
+ 
+@@ -561,9 +692,9 @@ class BaseSimulator:
+ 
+         try:
+             if self.config.get("INTERFACE", None):
+-                ChannelFactoryInitialize(self.config["DOMAIN_ID"], self.config["INTERFACE"])
++                ChannelFactoryInitialize(0,"lo")
+             else:
+-                ChannelFactoryInitialize(self.config["DOMAIN_ID"])
++                ChannelFactoryInitialize(0,"lo")
+         except Exception as e:
+             print(f"Note: Channel factory initialization attempt: {e}")
+ 

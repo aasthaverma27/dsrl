@@ -1,32 +1,3 @@
-"""DSRL-NA: noise aliasing. Paper Algorithm 1, adapted to a 1.3B action head.
-
-Two critics instead of one:
-
-  Q^A(s, a)  over ENVIRONMENT actions, trained by TD. The reward is a function of the
-             executed motion, so this is the space where the value function is smooth.
-  Q^W(s, w)  over NOISE, trained by supervised REGRESSION toward Q^A(s, pi_dp(s,w)).
-             No bootstrapping, no sparse reward -- a dense target for every sample.
-
-The actor optimises Q^W. This is the mechanism that addresses our measured failure:
-the noise critic previously learned by TD from a reward firing ~12 times per episode
-and reached cal_corr 0.15; here it learns by regression against an already-fitted
-action-space critic.
-
-TWO DOCUMENTED DEVIATIONS from Algorithm 1, both forced by the model's size:
-
-1. The Q^A target action. The paper uses a' ~ pi_dp(s', pi^W(s')), which needs one
-   denoise per batch element -- at batch 256 and utd 10 that is 2,560 denoises per
-   env step through a 1.09B DiT (52 ms each even batched), which does not fit in a
-   400 ms step. We use the action actually executed at s', which is already in the
-   buffer. This makes the target SARSA-style rather than an off-policy max: biased
-   toward the behaviour policy, but free.
-
-2. The (w, a) pairs for distillation come from collection, not from the training loop.
-   The policy server denoises K extra seeds off the same backbone pass, measured at
-   +7 ms for 16 candidates (the DiT is bandwidth-bound, so batching is ~free). So the
-   pairs are sampled once per real state rather than freshly each update.
-"""
-
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -125,9 +96,9 @@ class SacNA(SAC):
 
         # --- 1. Q^A: TD in action space -------------------------------------------
         with torch.no_grad():
-            _, next_logp = self.actor.sample(next_obs)
             q_next = self._reduce(self.critic_target(next_obs, next_env_act))
-            target = rew + (1 - done) * self.gamma * (q_next - self.alpha * next_logp)
+            target = rew + (1 - done) * self.gamma * q_next
+            target = target.clamp(-self.q_bound, self.q_bound)
         qs_a = self.critic(obs, env_act)
         loss_a = F.mse_loss(qs_a, target.expand_as(qs_a))
         self.critic_opt.zero_grad(set_to_none=True)

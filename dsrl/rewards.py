@@ -151,6 +151,8 @@ class RewardFn:
             if moved[i] > DISTURB_MOVE and not placed[i].any():
                 pay("disturb", cfg.disturb, i)
 
+                
+
         basket_tipped = tipped_mask(state["basket_quat"], cfg.tip_angle_deg)
         newly_tipped = basket_tipped & ~self.prev_basket_tipped
         if newly_tipped.any():

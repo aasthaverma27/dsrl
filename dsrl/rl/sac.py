@@ -124,6 +124,8 @@ class SAC:
         # policy. Small control tasks want that (-1/dim); we do not, because the
         # base policy we must not fall below is itself stochastic.
         self.target_entropy = float(act_dim) * cfg.target_entropy_per_dim
+        self.alpha_max = getattr(cfg, "alpha_max", 1.0)
+        self.q_bound = getattr(cfg, "q_bound", 60.0)
         self.log_alpha = torch.full(
             (1,), float(np.log(cfg.init_alpha)), device=self.device, requires_grad=True
         )
@@ -176,10 +178,12 @@ class SAC:
         obs, act, rew, next_obs, done = self.buffer.sample(batch_size, self.device)
 
         with torch.no_grad():
-            next_act, next_logp = self.actor.sample(next_obs)
+            next_act, _ = self.actor.sample(next_obs)
             qs_t = self.critic_target(next_obs, next_act)
             q_next = self._reduce(qs_t)
-            target = rew + (1 - done) * self.gamma * (q_next - self.alpha * next_logp)
+            # entropy stays in the actor loss only; q_bound is the provable return bound
+            target = rew + (1 - done) * self.gamma * q_next
+            target = target.clamp(-self.q_bound, self.q_bound)
 
         qs = self.critic(obs, act)
         critic_loss = F.mse_loss(qs, target.expand_as(qs))
@@ -198,6 +202,8 @@ class SAC:
         self.alpha_opt.zero_grad(set_to_none=True)
         alpha_loss.backward()
         self.alpha_opt.step()
+        with torch.no_grad():
+            self.log_alpha.clamp_(max=float(np.log(self.alpha_max)))
 
         with torch.no_grad():
             for p, pt in zip(self.critic.parameters(), self.critic_target.parameters()):

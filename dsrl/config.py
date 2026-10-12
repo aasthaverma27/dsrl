@@ -30,31 +30,35 @@ class GrootConfig:
     # from the action entirely and owned by the WBC.
     steerable_groups: tuple[str, ...] = ("right_arm", "right_hand")
 
-    # PER-COORDINATE bound on the noise, matching the reference implementation's
-    # `action_magnitude` (cfg/robomimic/dsrl_can.yaml: 1.5). Their action space is
-    # Box(-1.5, 1.5) over act_steps*action_dim with a standard tanh-squashed SAC
-    # actor, and their base-policy rollouts clip randn to the same range
-    # (utils.py:167-170). This replaces the shell projection, which was our own
-    # invention: it forced ||seed|| = sqrt(d) exactly, a constraint the reference
-    # does not impose.
+    # How many of the served 16 chunk rows the actor steers. 16 = the whole
+    # chunk (224 dims with arm+hand). 4 = the v1 authority-sweep winner
+    # (56 dims): the earliest rows carry most of the leverage because the WBC
+    # interpolator reaches later waypoints from wherever the early ones put
+    # the arm. Rows beyond steer_rows keep the base noise.
+    steer_rows: int = 16
+
+    # Redraw the base noise every CHUNK instead of every episode. E1/E3 round 1
+    # showed frozen per-episode noise costs ~24 pts of SR (47.8% no-op floor vs
+    # 72.2% native), and with steer_rows=4 the 12 unsteered rows drag the run
+    # toward that floor (40% eval vs 77% for full-row steering). Resampling
+    # restores native-like diversity in the slots the actor does not control,
+    # at the cost of making them an unobserved variable for the critic (the v1
+    # freeze_base_noise discussion, inverted).
+    resample_unsteered: bool = False
+
+
     noise_scale: float = 1.5
 
-    # Share one 14-value vector across all 16 chunk rows instead of steering each
-    # row independently: 224 knobs -> 14. Measured justification: resampling only
-    # our 224 slots moves the served action 74.6% as much as resampling all 5280,
-    # so these columns hold the leverage; and the chunk's across-row spread barely
-    # changes under a shared vector (0.707 vs 0.732) because that spread comes from
-    # the DiT's positional structure, not from row-to-row noise variation.
-    # REFUTED on the robot. Gate run gate14 (11 warmup episodes, layout 0) scored
-    # 0.82 cubes against 1.69 and 1.92 for full-rank warmup on the same layout, with
-    # 0 perfect episodes where full-rank had 5/13. Forcing all 16 steps to share one
-    # vector makes the deviation coherent across the whole 0.8 s chunk instead of
-    # averaging along it, which shows up as sustained wrist swings that jump at each
-    # chunk boundary. The offline checks missed this: across-row spread of the OUTPUT
-    # barely moved (0.707 vs 0.732), but nobody measured the spread of the chunk MEAN,
-    # which is the quantity that actually changed.
-    # A smooth temporal basis (constant + ramp = 28 dims) is the untested middle
-    # ground: 8x fewer dims without forcing the 16 steps to be identical.
+    # Residual steering (2026-08-18, after F18): the actor's action is ADDED to
+    # the base noise slots instead of replacing them. Under replace semantics a
+    # zero action wrote literal 0.0 into the 224 steered slots -- off-distribution
+    # for the flow model (it denoises from N(0,1)) and measured at 33.3% per-cube
+    # against 61.1% for on-distribution random slots (F18). With residual
+    # steering the no-op action keeps the seed exactly at the episode's base
+    # draw, so an untrained/timid actor starts from the base-seed floor rather
+    # than the degenerate zero-noise one.
+    steer_residual: bool = True
+
     share_across_chunk: bool = False
 
     # Hold the 5056 unsteered slots fixed for the whole run instead of redrawing
@@ -88,42 +92,25 @@ class RewardConfig:
     settle_steps: int = 10
     tip_angle_deg: float = 30.0
     fall_height: float = 0.2
-
-    # Milestones, paid once per cube per episode. Reward density was 5.6% of steps
-    # (~3 events/episode), which is what let the critic drift to a 22x overestimate
-    # with no ability to rank actions. These raise it to ~12 events/episode.
-    # Deliberately a ladder summing to 5.0 against correct_placement's 10.0, so
-    # completing a placement always dominates stopping partway. Once-per-cube, so
-    # none of them can be farmed by repeating a motion.
-    # NOTE: distinct from the shaping terms zeroed above. jerk_coeff was continuous
-    # and swamped the task (-270/episode vs a +30 ceiling); these are one-time
-    # payments on irreversible progress.
     first_contact: float = 0.5
     lifted: float = 1.5
     over_correct_basket: float = 3.0
-    # Below table_z minus this, a cube is on the floor and unrecoverable. Read by
-    # RewardFn (which computes the off_table flag), used by StackEnv to end an
-    # episode that has nothing left to earn. Generous, so a cube bouncing on the
-    # table surface is never mistaken for one that is gone.
+
     off_table_drop: float = 0.15
 
 @dataclass(frozen=True)
 class EnvConfig:
-    # B3: the client executes this many of the served 16 rows, then re-queries.
-    # 8, not the 4 originally planned. Replanning discontinuity measured 2026-08-12:
-    # the jump at a chunk boundary is ~equal to the motion the chunk performs at every
-    # N, so what matters is the RATE -- 0.765 units/s of discontinuity at N=4 against
-    # 0.411 at N=8 and 0.237 at N=16. Visible jerkiness on the robot at N=4.
+    # 16 = execute the whole served chunk. B3 (shortening this to buy throughput and
+    # fewer noise dimensions) is REFUTED on the robot:
+    #   N=4  visible jerkiness
+    #   N=8  warmup 1.45 (n=33) against a 1.74 reference, 0/3 rate 33% vs 12-18%,
+    #        and `dropped`/`grasp_slip` firing for the first time in any run
     # GR00T serves 16 rows and was deployed executing all 16; the reference tolerates
     # act_steps=4 only because their policy's horizon IS 4 (horizon_steps: act_steps).
-    # 8 keeps 2x throughput and halves the noise dimension while halving the switch
-    # rate. Latency is not the constraint: get_action_chunk is 73 ms against a 400 ms
-    # budget at N=8.
-    execute_steps: int = 8
-    # One env step is 2 chunks, so at execute_steps=4 that is 400 ms and a 70 s
-    # episode holds ~175 env steps. Set above that so max_secs is the binding
-    # limit rather than this counter (at execute_steps=16 the old value of 82 was
-    # the binding one; keeping it here would truncate B3 episodes at 33 s).
+    # Interrupting mid-chunk breaks grasps, and no amount of RL recovers a degraded
+    # base policy. Costs us the 4x throughput; that is the price of a working policy.
+    execute_steps: int = 16
+
     max_chunks: int = 200
     n_cubes: int = 3
     preplaced_choices: tuple[int, ...] = (0, 1, 2)
@@ -133,17 +120,9 @@ class EnvConfig:
         "gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml"
     )
     camera_keys: tuple[str, ...] = ("ego_view",)
-    # Stack env timing. reset_settle lets their WBC re-stabilise after the sim
-    # clock rewinds; ack_timeout catches a stalled client; max_secs is the wall
-    # clock twin of max_chunks, since the stack runs in real time.
     reset_settle_secs: float = 8.0
     ack_timeout_secs: float = 5.0
     max_secs: float = 70.0
-    # End an episode once every cube is either placed or knocked off the table, so
-    # a failed episode stops instead of burning the remaining 50 s. Buys roughly
-    # 1.5x more episodes per hour, and episodes/hour is the price of all information
-    # here. The threshold is deliberately far below the table (0.795 - 0.15) so a
-    # cube bouncing on the surface is never mistaken for one that is gone.
     early_terminate: bool = True
     instruction: str = (
         "observe the entire scene first. identify the red cube, blue cube, and "
@@ -210,11 +189,26 @@ class SacConfig:
     # bonus in every Bellman target, amplified 100x by gamma=0.99 -- the measured
     # q -> 13700 pathology. The tuner raises alpha if entropy falls below target.
     init_alpha: float = 0.01
+    # Upper bound on the entropy coefficient. target_entropy=0 gives the tuner no
+    # ceiling and it reached 11.2 in final2-l0, at which point alpha*logp swamped the
+    # task reward in the actor loss. Inactive while entropy is healthy.
+    alpha_max: float = 1.0
+    # Clamp on the critic target. A perfect episode pays 45 (3 cubes x 15) and measured
+    # return-to-go averaged 4.9 with a max of 27, so |value| > 60 is provably wrong and
+    # clamping cannot distort a correct estimate. This is the bound that actually stops
+    # the overestimation loop; removing the entropy term alone did not.
+    q_bound: float = 60.0
     # Noise aliasing: two critics, Q^A over environment actions trained by TD, and
     # Q^W over noise trained by regression against Q^A. Their default (algo: dsrl_na).
     # Requires the executed action chunk in the buffer and the ability to denoise at
     # arbitrary buffer states -- see NoiseAliasConfig.
-    use_noise_aliasing: bool = True
+    # OFF: reverted to plain DSRL-SAC 2026-08-12. NA ran for the first time in
+    # final2-l0 and was inert -- distill_loss diverged to 1.5e7, q to -4037, alpha to
+    # 11.2, and cal_corr ended negative, so Q^W carried no action-dependent signal.
+    # Result 1.71 (n=84) against a 1.86 baseline. The mechanism is implemented and
+    # tested; it needs the alpha*logp term removed from the Bellman target before it
+    # can be judged, which is not done yet.
+    use_noise_aliasing: bool = False
     # Their value is 10 (dsrl_can.yaml). Measured on our nets: an update is 21.6 ms and
     # a distill step ~11 ms, so utd 10 + 10 distill is 330 ms of a 400 ms B3 step (83%,
     # too tight); 5 distill steps gives 273 ms (68%). Still 1,280 pair-samples per env
@@ -227,24 +221,37 @@ class SacConfig:
     # pass. Measured +7 ms for 16 candidates, so the count is limited by memory rather
     # than time: 8 pairs at 200k capacity is ~630 MB in float16.
     na_pairs: int = 8
-    # Append a fixed random projection of the VLA's backbone features to the
-    # observation, so the actor conditions on what the base policy conditions on --
-    # the reference's noise policy sees the same observation as its diffusion policy,
-    # ours previously saw only privileged low-dim state and no camera.
-    # A projection rather than the raw 64x2048: 64 dims against a 117-dim observation
-    # is +55%, where the raw features would be 18x. Fixed and seeded, so nothing to
-    # learn. Features lag one env step (~400 ms) because they are produced BY the
-    # policy call we are choosing the seed for; the scene changes little in 400 ms.
-    visual_features: bool = True
+    # OFF: reverted with noise aliasing. Never tested in isolation, and it shares the
+    # feedback channel with NA, so with NA off there is nothing to carry the features.
+    visual_features: bool = False
     visual_dim: int = 64
-    # 200k, not 1M: our longest planned run is ~40k steps, and the NA buffer also
-    # holds the executed action plus na_pairs (noise, action) pairs per transition.
+
     replay_capacity: int = 200_000
-    # Matches their transition count exactly: init_rollout_steps 1501 x 4 envs = 6004.
-    # Transitions, not episodes, is the right unit -- it is what the critic fits on.
-    # At B3 speed (400 ms/step) this costs ~40 min and yields ~34 episodes; at the old
-    # 1.6 s/step it would have been 2.7 h. Previously we ran 500 (~11 episodes).
-    warmup_transitions: int = 6000
+    warmup_transitions: int = 600
+
+    # PixelSAC (round 5): give the actor/critic the ego view, matching the
+    # reference DSRL implementation (their pi0 agent is `pixel_sac`: raw
+    # pixels through a learned CNN + proprio; arXiv 2506.15799,
+    # github nakamotoo/dsrl_pi0). We use the DrQ recipe at our sample scale:
+    # shared conv encoder trained by the critic only (actor gets detached
+    # features), random-crop augmentation, 84x84 downscale of the SAME frame
+    # already rendered for GR00T. Replay capacity drops so image storage
+    # stays ~2.5 GB per run.
+    use_pixels: bool = False
+    pixel_size: int = 84
+    pixel_latent: int = 128
+    pixel_replay_capacity: int = 60_000
+
+    # Peak-anneal (round 6+): every confirmed 84-85% policy came from a checkpoint
+    # 10-20k steps before the run's END, then decayed back toward native as
+    # training continued (r4-warm 84.4@14k -> 77.8@30k final; r6-chain 83.9@10k
+    # -> 75.6@14k). SAC keeps taking full-size gradient steps after finding a
+    # good region and walks back out of it. anneal_after halves BOTH actor and
+    # critic LR each time a new best eval lands after this many steps, so later
+    # updates refine near the peak instead of overwriting it.
+    anneal_after: int = 8_000
+    anneal_factor: float = 0.5
+    anneal_min_lr_frac: float = 0.05
 
 @dataclass(frozen=True)
 class DsrlConfig:

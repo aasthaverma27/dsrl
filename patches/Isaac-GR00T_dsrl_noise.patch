@@ -1,0 +1,111 @@
+diff --git a/gr00t/model/gr00t_n1d7/gr00t_n1d7.py b/gr00t/model/gr00t_n1d7/gr00t_n1d7.py
+index 346b597..6560f42 100644
+--- a/gr00t/model/gr00t_n1d7/gr00t_n1d7.py
++++ b/gr00t/model/gr00t_n1d7/gr00t_n1d7.py
+@@ -346,11 +346,44 @@ class Gr00tN1d7ActionHead(nn.Module):
+         # Set initial actions as the sampled noise.
+         batch_size = vl_embeds.shape[0]
+         device = vl_embeds.device
+-        actions = torch.randn(
+-            size=(batch_size, self.config.action_horizon, self.action_dim),
+-            dtype=vl_embeds.dtype,
+-            device=device,
+-        )
++        # DSRL steers the frozen policy by choosing this initial noise instead of
++        # sampling it, so the RL agent acts in noise space rather than action space.
++        dsrl_noise = (options or {}).get("dsrl_noise")
++        # DSRL-NA needs (noise, action) pairs to distil an action-space critic into a
++        # noise-space one. Extra candidate seeds are batched through the SAME backbone
++        # pass, and the DiT is bandwidth-bound at these sizes, so 16 candidates cost
++        # the same 52 ms as one (measured 2026-08-11: batch 1 52.4 ms, batch 16
++        # 52.6 ms). Candidate 0 is the seed that actually executes.
++        dsrl_extra = (options or {}).get("dsrl_extra_noise")
++        n_extra = 0
++        if dsrl_extra is not None and batch_size == 1:
++            extra = torch.as_tensor(dsrl_extra, dtype=vl_embeds.dtype, device=device).reshape(
++                -1, self.config.action_horizon, self.action_dim
++            )
++            n_extra = extra.shape[0]
++            total = 1 + n_extra
++            vl_embeds = vl_embeds.expand(total, -1, -1)
++            state_features = state_features.expand(total, -1, -1)
++            embodiment_id = embodiment_id.repeat(total)
++            # the DiT reshapes these by batch*heads, so they must match the new batch
++            backbone_output = BatchFeature(data={
++                k: v.expand(total, *v.shape[1:]) if torch.is_tensor(v) else v
++                for k, v in backbone_output.items()
++            })
++            batch_size = total
++
++        if dsrl_noise is not None:
++            actions = torch.as_tensor(dsrl_noise, dtype=vl_embeds.dtype, device=device).reshape(
++                -1, self.config.action_horizon, self.action_dim
++            )
++            if n_extra:
++                actions = torch.cat([actions, extra], dim=0)
++        else:
++            actions = torch.randn(
++                size=(batch_size, self.config.action_horizon, self.action_dim),
++                dtype=vl_embeds.dtype,
++                device=device,
++            )
+ 
+         dt = 1.0 / self.num_inference_timesteps
+         vel_strength = torch.ones_like(actions)
+@@ -434,6 +467,18 @@ class Gr00tN1d7ActionHead(nn.Module):
+             # Update actions using euler integration.
+             actions = actions + dt * pred_velocity * vel_strength
+ 
++        if n_extra:
++            # Split the executed action from the DSRL candidates and restore the
++            # original batch on everything else, so callers see the stock shapes.
++            return BatchFeature(
++                data={
++                    "action_pred": actions[:1],
++                    "dsrl_candidate_actions": actions[1:],
++                    "backbone_features": vl_embeds[:1],
++                    "state_features": state_features[:1],
++                }
++            )
++
+         return BatchFeature(
+             data={
+                 "action_pred": actions,
+diff --git a/gr00t/policy/gr00t_policy.py b/gr00t/policy/gr00t_policy.py
+index 6f5a46b..4e6362e 100644
+--- a/gr00t/policy/gr00t_policy.py
++++ b/gr00t/policy/gr00t_policy.py
+@@ -414,7 +414,7 @@ class Gr00tPolicy(BasePolicy):
+ 
+         # Step 4: Run model inference to predict actions
+         with torch.inference_mode():
+-            model_pred = self.model.get_action(**collated_inputs)
++            model_pred = self.model.get_action(**collated_inputs, options=options)
+         normalized_action = model_pred["action_pred"].float()
+ 
+         # Step 5: Decode actions from normalized space back to physical units
+@@ -429,7 +429,23 @@ class Gr00tPolicy(BasePolicy):
+         casted_action = {
+             key: value.astype(np.float32) for key, value in unnormalized_action.items()
+         }
+-        return casted_action, {}
++        # DSRL hook: on request, return the normalized action chunk and the backbone
++        # features alongside the action. Both are already computed -- the action head
++        # returns them in its BatchFeature -- so this only forwards what exists.
++        # DSRL-NA needs the executed action (its Q^A is over environment actions) and
++        # the backbone features (to re-denoise at replayed states without re-running
++        # the 2B VLM). float16 halves the wire cost of a 64x2048 feature map.
++        info = {}
++        if (options or {}).get("dsrl_return_features"):
++            info["action_pred"] = normalized_action.cpu().numpy().astype(np.float16)
++            # dsrl_candidate_actions is the reason DSRL-NA exists -- the action head
++            # produces it from the batched extra seeds and the Q^W distillation
++            # regresses against it. Omitting it here silently starved the whole
++            # mechanism while every other metric looked healthy.
++            for key in ("backbone_features", "state_features", "dsrl_candidate_actions"):
++                if key in model_pred:
++                    info[key] = model_pred[key].float().cpu().numpy().astype(np.float16)
++        return casted_action, info
+ 
+     def check_action(self, action: dict[str, Any]) -> None:
+         """Validate that the action has the correct structure and types.

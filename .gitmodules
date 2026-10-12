@@ -1,0 +1,6 @@
+[submodule "external/Isaac-GR00T"]
+	path = external/Isaac-GR00T
+	url = https://github.com/NVIDIA/Isaac-GR00T.git
+[submodule "external/GR00T-WholeBodyControl"]
+	path = external/GR00T-WholeBodyControl
+	url = https://github.com/NVlabs/GR00T-WholeBodyControl.git

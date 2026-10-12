@@ -1,12 +1,9 @@
 [project]
 name = "dsrl"
 version = "0.1.0"
-description = "DSRL noise-seed steering of a frozen GR00T N1.7 VLA"
+description = "Diffusion steering via RL (DSRL) of a frozen GR00T N1.7 VLA on a Unitree G1 humanoid"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.7.1", "numpy>=1.24", "mujoco>=3.1", "tyro>=0.8"]
-
-[project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-xdist>=3.5"]
+dependencies = []   # see requirements.txt (exact pins) and scripts/setup.sh
 
 [build-system]
 requires = ["setuptools>=68"]
@@ -15,10 +12,3 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["dsrl*"]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-markers = [
-    "needs_checkpoint: requires the GR00T N1.7 checkpoint",
-    "needs_wbc: requires the WBC repo",
-    "slow: takes more than 30 seconds",
-]

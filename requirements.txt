@@ -1,0 +1,32 @@
+# Python 3.10. torch / torchvision come from the CUDA 12.8 index:
+#   uv pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
+# then:  uv pip install -r requirements.txt   (scripts/setup.sh does both)
+#
+# The pins below are the versions every reported result ran with.
+transformers==4.57.3        # 5.x breaks Gr00tN1d7Config
+diffusers==0.35.1
+einops==0.8.1
+peft==0.17.1
+omegaconf==2.3.0
+albumentations==1.4.18
+numpy==1.26.4
+mujoco==3.11.0
+onnxruntime==1.23.2
+pin==2.7.0                  # pinocchio: the whole-body controller's robot model
+cyclonedds==0.10.2          # unitree_sdk2py imports it (no DDS traffic in-process)
+opencv-python-headless==4.11.0.86
+termcolor
+dm-tree
+pandas
+pyarrow
+tyro
+jsonlines
+msgpack
+msgpack-numpy
+pyzmq
+lmdb
+gymnasium
+pyyaml
+safetensors
+pillow
+scipy

@@ -195,7 +195,12 @@ class StackEnv:
         steer = np.clip(steer, -1.0, 1.0).reshape(len(self.steer_rows), len(STEER_COLS))
         steer = steer * self.cfg.groot.noise_scale
         seed = self.base_noise.copy()
-        seed[0][np.ix_(self.steer_rows, STEER_COLS)] = steer
+        # Residual vs replace: see GrootConfig.steer_residual (F18 -- replace's
+        # zero action writes degenerate 0.0 noise; residual's keeps the base draw).
+        if self.cfg.groot.steer_residual:
+            seed[0][np.ix_(self.steer_rows, STEER_COLS)] += steer
+        else:
+            seed[0][np.ix_(self.steer_rows, STEER_COLS)] = steer
         return seed
 
     # ---------- noise aliasing ----------

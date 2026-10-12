@@ -1,0 +1,163 @@
+{
+  "groot": {
+    "action_horizon": 40,
+    "max_action_dim": 132,
+    "max_state_dim": 132,
+    "num_inference_timesteps": 4,
+    "backbone_embedding_dim": 2048,
+    "input_embedding_dim": 1536,
+    "hidden_size": 1024,
+    "state_history_length": 1,
+    "max_num_embodiments": 32,
+    "served_action_horizon": 16,
+    "live_action_dim": 35,
+    "policy_port": 5560,
+    "state_groups": [
+      [
+        "left_leg",
+        6
+      ],
+      [
+        "right_leg",
+        6
+      ],
+      [
+        "waist",
+        3
+      ],
+      [
+        "left_arm",
+        7
+      ],
+      [
+        "right_arm",
+        7
+      ],
+      [
+        "left_hand",
+        7
+      ],
+      [
+        "right_hand",
+        7
+      ]
+    ],
+    "action_groups": [
+      [
+        "left_arm",
+        7
+      ],
+      [
+        "right_arm",
+        7
+      ],
+      [
+        "left_hand",
+        7
+      ],
+      [
+        "right_hand",
+        7
+      ],
+      [
+        "waist",
+        3
+      ],
+      [
+        "base_height_command",
+        1
+      ],
+      [
+        "navigate_command",
+        3
+      ]
+    ],
+    "steerable_groups": [
+      "right_arm",
+      "right_hand"
+    ],
+    "steer_rows": 16,
+    "resample_unsteered": true,
+    "noise_scale": 1.5,
+    "steer_residual": true,
+    "share_across_chunk": false,
+    "freeze_base_noise": false
+  },
+  "reward": {
+    "correct_placement": 10.0,
+    "wrong_target": -10.0,
+    "dropped": -3.0,
+    "disturb": -2.0,
+    "target_tipped": -1.0,
+    "grasp_slip": -1.0,
+    "fell": -10.0,
+    "jerk_coeff": 0.0,
+    "approach_coeff": 0.0,
+    "approach_cap": 1.0,
+    "settle_speed": 0.01,
+    "settle_steps": 10,
+    "tip_angle_deg": 30.0,
+    "fall_height": 0.2,
+    "first_contact": 0.5,
+    "lifted": 1.5,
+    "over_correct_basket": 3.0,
+    "off_table_drop": 0.15
+  },
+  "env": {
+    "execute_steps": 16,
+    "max_chunks": 120,
+    "n_cubes": 3,
+    "preplaced_choices": [
+      0,
+      1,
+      2
+    ],
+    "control_hz": 20,
+    "cube_xy_jitter": 0.0,
+    "scene_xml": "gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml",
+    "camera_keys": [
+      "ego_view"
+    ],
+    "reset_settle_secs": 8.0,
+    "ack_timeout_secs": 5.0,
+    "max_secs": 70.0,
+    "early_terminate": true,
+    "instruction": "observe the entire scene first. identify the red cube, blue cube, and green cube. then pick up each cube and place it into the basket with the matching color. place the red cube in the red basket, the blue cube in the blue basket, and the green cube in the green basket. ensure every cube is placed in the correct colored basket."
+  },
+  "sac": {
+    "gamma": 0.97,
+    "tau": 0.005,
+    "utd": 10,
+    "lr": 0.0003,
+    "batch_size": 256,
+    "hidden": [
+      2048,
+      2048,
+      2048
+    ],
+    "activation": "tanh",
+    "layer_norm_actor": true,
+    "num_critics": 10,
+    "critic_reduction": "subset",
+    "critic_subset_size": 4,
+    "target_entropy_per_dim": 0.0,
+    "init_alpha": 0.01,
+    "alpha_max": 1.0,
+    "q_bound": 45.0,
+    "use_noise_aliasing": false,
+    "noise_critic_grad_steps": 5,
+    "na_distill_batch": 32,
+    "na_pairs": 8,
+    "visual_features": false,
+    "visual_dim": 64,
+    "replay_capacity": 200000,
+    "warmup_transitions": 600,
+    "use_pixels": true,
+    "pixel_size": 84,
+    "pixel_latent": 128,
+    "pixel_replay_capacity": 60000,
+    "anneal_after": 8000,
+    "anneal_factor": 0.5,
+    "anneal_min_lr_frac": 0.05
+  }
+}
